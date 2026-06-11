@@ -1,0 +1,5 @@
+skill_info:
+  name: zm-excel-add-one-row
+  version: 0.3.2
+  description: "将 Excel 列名提取为 Markdown 填写模板，用户填完后自动回填到表格末尾新增一行"
+  category: 工作流

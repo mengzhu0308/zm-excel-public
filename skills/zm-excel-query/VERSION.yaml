@@ -1,0 +1,5 @@
+skill_info:
+  name: zm-excel-query
+  version: 0.3.0
+  description: "Excel 数据查询 skill，支持数据预览、交互式查询、条件筛选、列选择、排序、去重、聚合，输出同目录同名 CSV"
+  category: 工作流

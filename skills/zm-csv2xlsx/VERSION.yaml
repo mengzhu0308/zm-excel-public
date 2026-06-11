@@ -1,0 +1,5 @@
+skill_info:
+  name: zm-csv2xlsx
+  version: 0.1.0
+  description: "将 CSV 文件转换为 Excel(.xlsx)格式，支持单文件、目录批量、文件列表三种输入模式，以及多 CSV 合并到一个 Excel 不同 sheet 中"
+  category: 工作流

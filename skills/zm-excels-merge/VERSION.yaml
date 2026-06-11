@@ -1,0 +1,5 @@
+skill_info:
+  name: zm-excels-merge
+  version: 0.4.0
+  description: "合并多个 Excel（xlsx/xls）和 CSV 文件，支持智能字段分组、单文件多 sheet 合并、字段兼容性分析、合并清单工作流和自动输出目录推断"
+  category: 工作流
