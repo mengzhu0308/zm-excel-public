@@ -1,0 +1,18 @@
+# 发布流程自动产生的会话缓存，不进入源码仓库
+.cache/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+
+# 编辑器 / OS 临时
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
