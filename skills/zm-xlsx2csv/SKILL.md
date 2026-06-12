@@ -1,7 +1,7 @@
 ---
 name: zm-xlsx2csv
 description: >-
-  将 Excel 文件（.xlsx/.xls/.xlsm）转换为 CSV。批量或单个文件转换，支持自动编码检测，多 sheet 时各 sheet 输出为独立 CSV。
+  将 Excel 文件（.xlsx/.xls/.xlsm）转换为 CSV。批量或单个文件转换，多 sheet 时各 sheet 输出为独立 CSV。
 license: MIT
 metadata:
   skill_mode: workflow
@@ -9,6 +9,10 @@ compatibility:
   runtime:
     - name: agent-skills
       call_command: "conda run -n agent-skills python \"$SKILL_DIR/scripts/excel2csv.py\" [args]"
+    - name: system-python
+      call_command: "python3 \"$SKILL_DIR/scripts/excel2csv.py\" [args]"
+    - name: uv
+      call_command: "uv run --with pandas --with openpyxl --with 'xlrd<2.0' python \"$SKILL_DIR/scripts/excel2csv.py\" [args]"
 ---
 
 # zm-xlsx2csv
@@ -49,6 +53,8 @@ compatibility:
 
 `${SKILL_DIR}` 由调用本 skill 的运行时（Codex CLI / Claude Code 等）注入，指向 skill 安装根目录；纯 shell 环境请用绝对路径替换。
 
+优先使用 `agent-skills` runtime（依赖 `pandas` / `openpyxl` / `xlrd<2.0` 已装齐）；如不可用，降级到 `system-python`（需自行装依赖）或 `uv`（自动按 `--with` 装依赖）。完整三套模板见 [`references/runtime-env.md`](references/runtime-env.md)。
+
 ```bash
 # 单文件
 conda run -n agent-skills python "$SKILL_DIR/scripts/excel2csv.py" data.xlsx
@@ -76,7 +82,12 @@ conda run -n agent-skills python "$SKILL_DIR/scripts/excel2csv.py" ./data/ --str
 
 # 单 sheet 读取超时（秒）
 conda run -n agent-skills python "$SKILL_DIR/scripts/excel2csv.py" data.xlsx --timeout 30
+
+# 强制覆盖 + 输出文件名冲突自动加 _1/_2 后缀（最多到 _9999）
+conda run -n agent-skills python "$SKILL_DIR/scripts/excel2csv.py" data.xlsx --overwrite --unique
 ```
+
+> **`--unique` 单用是 no-op**：必须与 `--overwrite` 一起使用才会生成 `_1`/`_2` 后缀；单用 `--unique` + 已存在 CSV 时，与默认行为一致——静默跳过并打 warning。完整参数边界见 [`references/implementation.md` 参数校验边界](references/implementation.md#参数校验边界)。
 
 AI 推理执行时，若用户需求明确且参数可一次性确定，优先使用脚本调用。
 
@@ -117,7 +128,7 @@ else:
 
 ## 实现规范
 
-实现规范（读取 / 写入 / 命名 / 批量容错 / 退出码）见 [`references/implementation.md`](references/implementation.md)。
+实现规范（读取 / 写入 / 命名 / 批量容错 / 退出码）见 [`references/implementation.md`](references/implementation.md)。退出码契约的**完整表格**见 [`references/implementation.md` 退出码契约](references/implementation.md#退出码契约单一真相来源)；已存在跳过不计入失败，不影响退出码。
 
 ## 排错参考
 
@@ -125,8 +136,12 @@ else:
 
 - 中文乱码 → 确认 CSV 头三字节为 `EF BB BF`（utf-8-sig BOM）
 - 前导零丢失 → 确认 `dtype=str` 生效（脚本已默认）；如脱离脚本手动调用 `pd.read_excel`，需自行加 `dtype=str`
-- `.xls` 读取失败 → 提示安装 `xlrd<2.0`；当前 conda `agent-skills` 已含
+- `.xls` 读取失败 → 推荐环境 `agent-skills`（已装 `xlrd<2.0`），其他环境需自行 `pip install 'xlrd<2.0'`
 - 批处理意外中断 → 检查脚本是否支持"批量跳过失败"（见 [`references/implementation.md`](references/implementation.md)）；如使用旧版，可手动将每个文件单独跑
 - 公式 cell 值陈旧 → openpyxl 不计算公式，CSV 反映 Excel 上次保存时的值；如需最新值请先在 Excel 中 `Ctrl+Alt+F9` 强制重算后保存
 - 隐藏文件被误读 → Linux/macOS 上 `.hidden.xlsx` 与普通文件等价，会被 `--recursive` 拾取；Windows 上由文件系统隐藏属性决定，可先在资源管理器取消隐藏再跑
+- 路径安全（`output directory X is outside source directory Y`）→ 使用 `-o` 写到了源文件父目录之外时，脚本会打 soft warning 不阻断；确认是预期行为后可忽略
+- 权限受限子目录被静默跳过 → `--recursive` 遇到无读权限的子目录会打 warning 并跳过（`exit 0`）；如需完整覆盖，请先 `chmod -R u+rwX <dir>` 或用 root 跑
+- sheet 名大小写不匹配 → 默认严格区分大小写（与 openpyxl 行为一致）；请确认 sheet 名拼写或改用 `-s <索引>`
+- Windows cmd.exe 下 `${SKILL_DIR}` 不解析 → cmd.exe 变量语法是 `%SKILL_DIR%`；先用 `set SKILL_DIR=...` 定义或直接用绝对路径
 - `$SKILL_DIR` 未定义 → 调用方未注入；改用绝对路径或从 `references/runtime-env.md` 查回退

@@ -4,6 +4,19 @@
 import argparse
 import sys
 
+from _common import _setup_path, localize_error
+
+# Make sibling imports resolvable when launched as a top-level script
+# or via `python3 -m scripts.add_one_row` (where sys.path[0] is cwd,
+# not the scripts/ directory).
+_setup_path()
+
+try:
+    import openpyxl  # noqa: F401  (imported for error messaging in __main__)
+except ImportError:
+    print("Error: openpyxl is required. Install with: pip install openpyxl")
+    sys.exit(1)
+
 
 def _add_extract_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("excel", help="Path to the Excel file")
@@ -36,20 +49,19 @@ def _add_write_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _handle_error(exc: Exception) -> None:
-    if isinstance(exc, FileExistsError):
-        print(f"Error: {exc}")
-        sys.exit(2)
-    if isinstance(exc, FileNotFoundError):
-        print(f"Error: {exc}")
-        sys.exit(1)
-    if isinstance(exc, PermissionError):
-        fname = exc.filename or "<unknown>"
-        print(f"Error: Excel 文件被其他程序占用或无写权限: {fname}。请关闭 Excel 后重试。")
-        sys.exit(1)
+# Mapping of exception type → exit code. Centralized here so the three
+# entrypoints (add_one_row.py, extract_template.py main(), write_back.py
+# main()) share the same exit-code contract.
+_EXIT_CODE_BY_EXC_TYPE = {
+    FileExistsError: 2,
+    FileNotFoundError: 1,
+    PermissionError: 1,
+}
 
-    print(f"Error: {exc}")
-    sys.exit(1)
+
+def _handle_error(exc: Exception) -> None:
+    print(localize_error(exc))
+    sys.exit(_EXIT_CODE_BY_EXC_TYPE.get(type(exc), 1))
 
 
 def main() -> None:

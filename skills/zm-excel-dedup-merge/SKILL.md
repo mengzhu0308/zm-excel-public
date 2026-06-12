@@ -2,7 +2,7 @@
 name: zm-excel-dedup-merge
 description: >-
   将两个 CSV/XLSX 表格按关键列去重合并。触发：合并同名记录（期刊目录、产品清单、人员名册等）；
-  不触发：垂直拼接多表（用 `zm-excels-merge`）、单表查询（用 `zm-excel-query`）、格式调整（用 `zm-excel-formalization`）。
+  不触发：垂直拼接多表（用垂直拼接类 skill）、单表查询（用查询类 skill）、格式调整（用格式整理类 skill）。
 license: MIT
 metadata:
   skill_mode: hybrid
@@ -20,16 +20,12 @@ compatibility:
 
 ## 核心原则
 
-- **关键列匹配，非行追加**：与 `zm-excels-merge`（垂直拼接）不同，核心是”同一实体 → 合并为一行”
+- **关键列匹配，非行追加**：与垂直拼接类 skill（按行追加）不同，核心是"同一实体 → 合并为一行"
 - **自动检测关键列**：两表有同名列时自动识别；无同名列时找最相似列名配对
 - **精确匹配优先，模糊兜底**：默认先标准化精确匹配，未匹配项再做模糊替换
 - **列名冲突自动加后缀**：两表非关键列同名时，文件2列自动加 `_2` 后缀
 - **输入格式决定输出格式**：CSV+CSV→CSV，XLSX+XLSX→XLSX，混合→XLSX
 - **源文件只读**：操作在内存中进行
-
-## 与会话层目标跟踪（/goal）配合
-
-`/goal` 是会话层（Codex CLI / Claude Code 等平台）提供的任务跟踪能力，不是本 skill 的脚本参数。本 skill 的 `dedup_merge.py` 与 `/goal` **无任何依赖**：当关键列明确、风险较低时，可直接执行；当关键列需要确认、模糊匹配风险较高或需要先 dry-run 再写入时，**可选**在会话层开启 `/goal` 记录目标与检查点，但绝不能将其视为本 skill 的硬性前置步骤。
 
 ## 匹配策略
 
@@ -52,7 +48,8 @@ compatibility:
 ### 脚本调用
 
 ```bash
-SKILL_DIR="/absolute/path/to/zm-excel-dedup-merge"
+# 安装态：环境变量 $SKILL_DIR 已被 project-install 注入到本机运行态；源码态可手动指定：
+SKILL_DIR="${SKILL_DIR:-$PWD}"  # 安装态无需覆盖；源码态 cd 到 skills/zm-excel-dedup-merge 后执行
 conda run -n agent-skills python "$SKILL_DIR/scripts/dedup_merge.py" \
   -1 tableA.csv -2 tableB.csv \
   [--key1 "列名"] [--key2 "列名"] \
@@ -65,12 +62,16 @@ conda run -n agent-skills python "$SKILL_DIR/scripts/dedup_merge.py" \
 | `-2`, `--file2` | **必需** 第二个输入文件 |
 | `--key1` | 文件1关键列名（默认自动检测） |
 | `--key2` | 文件2关键列名（默认与 `--key1` 相同或自动检测） |
+| `--key-uniqueness-min` | 自动检测关键列时要求的最低唯一值比例（0-1，默认 `0.5`）；当短列名（`id` / `name`）占多数或重复值过多时下调到 `0.1`-`0.3` 可放宽阈值 |
 | `-o`, `--output` | 输出路径（默认 `dedup_merged.<ext>`，位于当前工作目录） |
+| `--force` | 允许覆盖已存在主表（默认拒绝覆盖；不影响 `-o` 与输入重名护栏） |
 | `--no-fuzzy` | 关闭模糊匹配 |
 | `--fuzzy-preset` | 模糊匹配预设（`academic` / `cjk` / `none`），默认 `academic`；详见下文 |
 | `--sort-by-key` | 合并后按关键列排序（默认关闭，保留两表原行序） |
 | `--dry-run` | 预览匹配统计，不写入主表 |
 | `--match-log` | 显式指定匹配明细 CSV 路径（仅在 `dry-run` 下生效；缺省时不写） |
+| `--version` | 打印脚本版本号（读取自 `VERSION.yaml.skill_info.version`）并退出 |
+| `--check-conda-env-consistency` | 自检：核对 `SKILL.md` frontmatter `compatibility.runtime[*].name` 与 `agents/openai.yaml` `system_requirements.conda_env` 一致性；返回 0 表示一致，1 表示不一致；不必提供 `-1` / `-2` 即可单独运行 |
 | `-v`, `--verbose` | 详细日志 |
 
 ## 前置依赖
@@ -78,10 +79,16 @@ conda run -n agent-skills python "$SKILL_DIR/scripts/dedup_merge.py" \
 - Python 3.8+
 - `pandas`（读取 CSV/Excel）
 - `openpyxl`（写入/读取 `.xlsx`）
+- 真实运行命令以 `compatibility.runtime.call_command` 为准；默认走 `conda run -n agent-skills`；未装 `conda` 时按下方"conda 环境"段备选
 
 安装示例：
 
 ```bash
+# 方式 1：conda（与 call_command 一致）
+conda create -n agent-skills python=3.9
+conda run -n agent-skills pip install pandas openpyxl
+
+# 方式 2：pip（仅当你已把脚本改用本地 python3 / 系统环境）
 python3 -m pip install pandas openpyxl
 ```
 
@@ -112,6 +119,7 @@ python3 -m pip install pandas openpyxl
 - 关键列空值（NaN、None、空串、纯空白）不参与匹配，会单独记入 `null_key_1` / `null_key_2`，同时在合并表中作为 `left_only` / `right_only` 行保留
 - 两表关键列列名不同时，建议显式指定 `--key1` / `--key2`
 - 大表（>10w 行）建议先用 `--dry-run` 预览；模糊匹配阶段会做两次 DataFrame 合并，性能随行数平方增长
+- **fuzzy 实测参考**（`--fuzzy-preset academic`，可复现基准见 `evals/bench_fuzzy.py` 与 `assets/bench_fuzzy_1k.csv`）：1k×1k ≈ 0.39s、5k×5k ≈ 0.47s、10k×10k ≈ 0.53s；>10w 行建议先分桶或关闭模糊（`--no-fuzzy`）。复现命令：`python3 evals/bench_fuzzy.py --sizes 1k 5k 10k`；不同 Linux / Python / pandas 版本的数字会有偏差，应按"参考量级"对待。
 - 两表非关键列同名时，文件1保持原名称，文件2追加 `_2` 后缀（已存在 `_1` / `_2` 时按 `_3`、`_4`... 顺延）
 - 默认不排序；如需按关键列排序，传 `--sort-by-key`
 - 两表无共有列时，列名自动检测会退化为 `difflib` 序列相似度配对，对短列名（如 `id` / `name`）可能给出非直觉结果，建议显式指定 `--key1` / `--key2`

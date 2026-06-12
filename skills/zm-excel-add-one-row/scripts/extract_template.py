@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Extract Excel headers and sample row into a Markdown template."""
 
-import argparse
 import sys
 from pathlib import Path
 from typing import Optional
 
 from _common import (
+    _setup_path,
     assert_headers_present,
     detect_header_row,
     find_sample_row,
     load_workbook,
+    localize_error,
     read_headers,
     select_worksheet,
     validate_excel_extension,
 )
+
+# Make sibling imports resolvable when launched as a top-level script
+# or via `python3 -m scripts.extract_template`.
+_setup_path()
 
 try:
     import openpyxl  # noqa: F401  (imported for error messaging in __main__)
@@ -69,7 +74,8 @@ def extract_template(
 
         assert_headers_present(headers)
 
-        sample_row_idx = find_sample_row(ws, header_row_idx)
+        header_cols = [c.column for c, name in zip(ws[header_row_idx], headers) if name != ""]
+        sample_row_idx = find_sample_row(ws, header_cols)
         sample_row: dict[int, str] = {}
         if sample_row_idx is not None:
             for idx, cell in enumerate(ws[sample_row_idx], start=1):
@@ -117,41 +123,10 @@ def extract_template(
         wb.close()
     return str(md_path)
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Extract Excel headers into a Markdown template")
-    parser.add_argument("excel", help="Path to the Excel file")
-    parser.add_argument("--output", "-o", help="Output Markdown file path (optional)")
-    parser.add_argument(
-        "--sheet", "-s", metavar="NAME",
-        help="Worksheet name to extract from (optional; defaults to active sheet)",
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Overwrite an existing template file (default: refuse to overwrite)",
-    )
-    args = parser.parse_args()
-
-    try:
-        result = extract_template(args.excel, args.output, args.sheet, force=args.force)
-        print(f"Template generated: {result}")
-    except FileExistsError as e:
-        print(f"Error: {e}")
-        sys.exit(2)
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-    except PermissionError as e:
-        # PermissionError raised by openpyxl itself may have e.filename
-        # set to None; fall back to a placeholder to avoid rendering
-        # the bare string "None" in the user-facing message.
-        fname = e.filename or "<unknown>"
-        print(f"Error: Excel 文件被其他程序占用或无写权限: {fname}。请关闭 Excel 后重试。")
-        sys.exit(1)
-    except Exception as e:  # noqa: BLE001
-        print(f"Error: {e}")
-        sys.exit(1)
-
-
 if __name__ == "__main__":
-    main()
+    print(
+        "deprecated: 直接运行 `extract_template.py` 已废弃，请改用 `add_one_row.py extract`；"
+        "历史 argparse 入口与 main() 已从该脚本移除，extract 逻辑以 add_one_row.py 为唯一入口",
+        file=sys.stderr,
+    )
+    sys.exit(1)

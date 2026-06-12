@@ -1,5 +1,5 @@
 skill_info:
   name: zm-excel-del-multi-rows
-  version: 0.1.0
+  version: 0.1.1
   description: "按关键词搜索并删除 Excel/CSV 中匹配的多行数据，输出到新文件，源文件只读不修改"
   category: 工作流

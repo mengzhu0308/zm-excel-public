@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """Parse filled Markdown template and append a new row to Excel."""
 
-import argparse
 import re
 import sys
 from pathlib import Path
 from typing import Optional
 
 from _common import (
+    _setup_path,
+    MAX_AUTO_INCREMENT,
     assert_headers_present,
     copy_styles,
     detect_header_row,
     find_sample_row,
     load_workbook,
+    localize_error,
+    raise_auto_increment_limit,
     read_headers,
     select_worksheet,
     validate_excel_extension,
 )
+
+# Make sibling imports resolvable when launched as a top-level script
+# or via `python3 -m scripts.write_back`.
+_setup_path()
 
 try:
     import openpyxl
@@ -28,15 +35,18 @@ except ImportError:
 PLACEHOLDER = "[在此填写]"
 
 # Strings with more than this many digits are likely IDs/phone numbers/account
-# numbers. Converting them to int would lose precision in Excel (15-digit
-# limit) or strip leading zeros. Keep them as strings.
+# numbers and should bypass the int() coercion. The threshold is set to 10,
+# deliberately below Excel's 15-digit precision ceiling: a 10–15 digit band
+# leaves enough headroom that the 15-digit float64 round-trip can't quietly
+# flip the trailing digits while still catching the common cases
+# (身份证 18 位, 手机号 11 位, 银行卡 16–19 位, 工号 > 10 位). This is the
+# single source of truth for that policy; SKILL.md 注意事项 / README.md Q&A
+# mirror it but do not redefine it.
 LONG_DIGIT_THRESHOLD = 10
 
-# Cap for output auto-increment (<stem>_增加一行.xlsx → _2.xlsx → ... → _9999.xlsx).
-# Mirrors the limit documented in SKILL.md and README.md; surfaces a
-# FileExistsError when reached, prompting the user to clean the directory
-# or use --output to write elsewhere.
-MAX_AUTO_INCREMENT = 9999
+# Cap for output auto-increment is re-exported from `_common` at the top
+# of this module; see `_common.MAX_AUTO_INCREMENT` and
+# `_common.raise_auto_increment_limit` for the single source of truth.
 
 
 def _safe_int(text: str) -> Optional[object]:
@@ -203,21 +213,24 @@ def _print_preview(
 ) -> None:
     """Print a formatted preview of the row to be appended.
 
-    Also surfaces the row number the new row will land on, so users running
-    --dry-run can verify the insertion point (e.g. when the sheet contains
-    hidden rows or filters that change max_row).
+    Surfaces the row number the new row will land on FIRST (above the
+    field-by-field table) so users running --dry-run can verify the
+    insertion point immediately (e.g. when the sheet contains hidden
+    rows or filters that change max_row). The field list is then
+    numbered with a 1-based index for easy cross-referencing.
     """
     print("=" * 50)
-    print("预览：即将追加到 Excel 的新行数据")
+    print(f"预览：即将追加到 Excel 第 {next_row} 行的数据")
     print("=" * 50)
 
     max_header_len = max((len(h) for h in headers), default=0)
-    for header, value in zip(headers, new_row):
+    for idx, (header, value) in enumerate(zip(headers, new_row), start=1):
         display = "(空)" if value is None else str(value)
-        print(f"  {header.ljust(max_header_len)}  →  {display}")
+        print(
+            f"  {str(idx).rjust(2)}. {header.ljust(max_header_len)}  →  {display}"
+        )
 
     print("=" * 50)
-    print(f"新行将追加到第 {next_row} 行")
 
     if md_only_fields:
         print(f"警告: Markdown 中有但 Excel 表头没有的字段（已忽略）: {md_only_fields}")
@@ -234,11 +247,17 @@ def _resolve_output_path(
 
     Priority:
       1. explicit_output (--output CLI / function arg) — used as-is;
-         if it already exists and not force, raise FileExistsError
+         if it already exists and not force, raise FileExistsError.
+         Note: --force is ONLY honored in this branch; the auto-increment
+         branch below intentionally never overwrites an existing
+         <stem>_增加一行*.xlsx, so passing --force without --output will
+         still increment rather than clobber the first slot.
       2. <stem>_增加一行.xlsx — if exists, increment to
          <stem>_增加一行_2.xlsx, <stem>_增加一行_3.xlsx, ... so that
          consecutive calls on the same source do NOT clobber the
-         previously generated output file
+         previously generated output file. The scan starts at _2 and
+         returns the first gap; it does NOT fill intermediate holes
+         left by manually deleted files (by design — see SKILL.md).
     """
     if explicit_output:
         out = Path(explicit_output)
@@ -261,13 +280,11 @@ def _resolve_output_path(
             return candidate
         n += 1
         if n > MAX_AUTO_INCREMENT:
-            raise FileExistsError(
-                f"Auto-increment reached the {MAX_AUTO_INCREMENT} limit for outputs matching "
-                f"{base.name}*. No available filename of the form "
-                f"'{excel_file.stem}_增加一行_<n>.xlsx' was found. "
-                f"Clean up the target directory or pass --output explicitly "
-                f"to write to a different path."
-            )
+            # Defer the FileExistsError construction (and the existing-index
+            # glob) to _common.raise_auto_increment_limit so the marker
+            # substring, the cap, and the wording all live in one place.
+            # See _common._AUTO_INCREMENT_LIMIT_MARKER for the marker.
+            raise_auto_increment_limit(excel_file, base)
 
 
 def write_back(
@@ -322,7 +339,7 @@ def write_back(
     # openpyxl Workbook does NOT implement the context manager protocol;
     # release the file handle explicitly in try/finally to avoid file-lock
     # leaks (notably on Windows).
-    wb = load_workbook(str(excel_file), data_only=False)
+    wb = load_workbook(str(excel_file), data_only=False, keep_vba=True)
     try:
         ws = select_worksheet(wb, effective_sheet)
 
@@ -333,7 +350,8 @@ def write_back(
         # Build a parallel sample-row lookup so we can preserve numeric
         # coercion intent. sample_by_header maps Excel header -> sample
         # value (str).
-        sample_row_idx = find_sample_row(ws, header_row_idx)
+        header_cols = [c.column for c, name in zip(ws[header_row_idx], headers) if name != ""]
+        sample_row_idx = find_sample_row(ws, header_cols)
         sample_by_header: dict[str, str] = {}
         if sample_row_idx is not None:
             for cell in ws[sample_row_idx]:
@@ -412,54 +430,10 @@ def write_back(
     finally:
         wb.close()
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Append Markdown data back to Excel")
-    parser.add_argument("excel", help="Path to the Excel file")
-    parser.add_argument("md", help="Path to the filled Markdown template")
-    parser.add_argument("--dry-run", action="store_true", help="Preview only, do not write file")
-    parser.add_argument(
-        "--sheet", "-s", metavar="NAME",
-        help="Target worksheet name (overrides sheet in Markdown template; optional)",
-    )
-    parser.add_argument(
-        "--output", "-o", metavar="PATH",
-        help="Output xlsx path (optional; default: <stem>_增加一行.xlsx, auto-incremented if exists)",
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Overwrite an existing --output file (default: refuse to overwrite explicit output)",
-    )
-    args = parser.parse_args()
-
-    try:
-        write_back(
-            args.excel, args.md,
-            dry_run=args.dry_run,
-            sheet_name=args.sheet,
-            output_path=args.output,
-            force=args.force,
-        )
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-    except FileExistsError as e:
-        print(f"Error: {e}")
-        sys.exit(2)
-    except PermissionError as e:
-        # PermissionError raised by openpyxl itself may have e.filename
-        # set to None; fall back to a placeholder to avoid rendering the
-        # bare string "None" in the user-facing message.
-        fname = e.filename or "<unknown>"
-        print(
-            f"Error: Excel 文件被其他程序占用或无写权限: {fname}。"
-            f"请关闭 Excel 后重试。"
-        )
-        sys.exit(1)
-    except Exception as e:  # noqa: BLE001
-        print(f"Error: {e}")
-        sys.exit(1)
-
-
 if __name__ == "__main__":
-    main()
+    print(
+        "deprecated: 直接运行 `write_back.py` 已废弃，请改用 `add_one_row.py write`；"
+        "历史 argparse 入口与 main() 已从该脚本移除，write 逻辑以 add_one_row.py 为唯一入口",
+        file=sys.stderr,
+    )
+    sys.exit(1)

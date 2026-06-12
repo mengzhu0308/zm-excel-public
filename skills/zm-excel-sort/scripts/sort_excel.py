@@ -7,6 +7,7 @@ zm-excel-sort 执行脚本
 import argparse
 import json
 import sys
+import traceback
 from copy import copy
 from pathlib import Path
 
@@ -87,13 +88,15 @@ def load_input(filepath, sheet_spec, verbose=False):
         # 尝试 UTF-8 带 BOM，然后普通 UTF-8，最后回退常见中文编码
         encodings = ["utf-8-sig", "utf-8", "gbk", "gb2312", "gb18030", "latin1"]
         df = None
+        enc = encodings[0]  # 默认初始化，避免 enc unbound 警告（真正使用的值由 for 循环赋值）
         for enc in encodings:
             try:
                 df = pd.read_csv(filepath, encoding=enc)
                 # P1-7：正常编码走 verbose；仅 latin1 兜底时强制 stderr 提示，避免静默吞错
                 if enc == "latin1":
                     print(
-                        f"[zm-excel-sort] CSV 编码检测: {enc}（兜底；建议显式指定 UTF-8）",
+                        f"[zm-excel-sort] CSV 编码检测: {enc}（兜底；可能存在乱码，"
+                        f"建议显式指定 UTF-8 / GBK / GB18030 等真实编码）",
                         file=sys.stderr,
                     )
                 else:
@@ -101,8 +104,10 @@ def load_input(filepath, sheet_spec, verbose=False):
                 break
             except UnicodeDecodeError:
                 continue
-        if df is None:
-            raise ValueError("无法解码 CSV 文件，尝试了多种编码")
+        # 注：原循环之后曾含一个"df is None 时 raise ValueError"的死代码分支。
+        # A-2 P0-2 修复：删除该分支——latin1 是 0-255 全字符编码，任意字节序列都能解码，
+        # 该错误永远不会被触发；仅保留此处注释作为变更轨迹。同时把 latin1 兜底提示
+        # 改为更明确的乱码警告。
 
         headers = list(df.columns)
         data_rows = df.values.tolist()
@@ -130,35 +135,64 @@ def load_input(filepath, sheet_spec, verbose=False):
         ws = wb[ws_name]
         log(f"使用 Sheet: {ws_name}", verbose)
 
-        # 读取所有数据
-        all_rows = list(ws.iter_rows(values_only=False))
-        if not all_rows:
-            return [], [], {"source": "xlsx", "workbook": wb, "worksheet": ws, "sheet_name": ws_name}
-
-        headers = [cell.value for cell in all_rows[0]]
-        data_rows = all_rows[1:]
-
-        # 提取样式信息
+        # 提取样式信息（P0-5 修复：先初始化 styles，再写入 merged_cells，避免 unbound）
+        # P1-2 修复：data_validations copy 改为 try/except + log 模式，与 A-1 P0-3 修复 tables 同风格；
+        # 老 openpyxl 中 dv.copy() 在 DataValidation 含 formula1 复杂表达式时可能抛 AttributeError，
+        # 整条 load_input 链崩溃——改为单条失败单条 log，不阻断 load_input
+        dv_copies = []
+        for _dv in ws.data_validations.dataValidation:
+            try:
+                dv_copies.append(copy(_dv))
+            except Exception as e:
+                log(f"复制 DataValidation '{_dv}' 失败（{type(e).__name__}: {e}）；跳过", verbose)
         styles = {
             "column_dimensions": {},
             "row_dimensions": {},
-            "merged_cells": list(ws.merged_cells.ranges),
             "cell_styles": [],
             "cell_comments": [],
             "cell_hyperlinks": [],
             # 排序后会丢失或失真的项：先抽取再在 write_xlsx 中尝试保留
             "freeze_panes": ws.freeze_panes,
             "conditional_formatting": [],
-            "data_validations": [copy(dv) for dv in ws.data_validations.dataValidation],
+            "data_validations": dv_copies,
             "tables": [],
+            "merged_cells": [],
         }
+
+        # P0-5 修复：ws.merged_cells.ranges 在 openpyxl < 3.0.5 不存在
+        # 统一在 styles 字典中记录，write_xlsx 阶段再按 ranges/字符串协议使用
+        try:
+            merged_ranges = list(ws.merged_cells.ranges)
+        except AttributeError:
+            # 老 API：ws.merged_cells 自身是 MergedCellRange 集合
+            try:
+                merged_ranges = list(ws.merged_cells)
+            except Exception as e:
+                log(f"读取合并单元格失败（{type(e).__name__}: {e}）；将不复制合并", verbose)
+                merged_ranges = []
+        styles["merged_cells"] = merged_ranges
+
+        # 读取所有数据
+        all_rows = list(ws.iter_rows(values_only=False))
+        if not all_rows:
+            return [], [], {"source": "xlsx", "workbook": wb, "worksheet": ws, "sheet_name": ws_name}
+
+        headers = [cell.value for cell in all_rows[0]]
+        # P1-3 修复：合并表头场景下，MergedCell（非左上角）取值返回 None
+        # 保留 None 占位以保持列数对齐；DataFrame 构造时 openpyxl / pandas 会用 NaN 占位
+        # 后续如果 column 名称为 None，sort_data 会让 AI 据此回退到用户确认（已由字段不存在校验覆盖）
+        data_rows = all_rows[1:]
 
         # P1-4：访问 openpyxl 私有 API `_cf_rules` 加 try/except + log 兜底
         try:
             cf_rules = ws.conditional_formatting._cf_rules
+            # B-1 修复：_cf_rules 的 key 是 ConditionalFormatting 包装类；
+            # key.sqref 是 MultiCellRange，str() 后拿干净 'A2:A3' 字符串；
+            # add() 接 str 时会包装为 ConditionalFormatting，存盘走 to_tree() 正常；
+            # 不能传 MultiCellRange（add() 不会包装，存盘 to_tree() 崩 'MultiCellRange' has no 'to_tree'）
             styles["conditional_formatting"] = [
-                (str(rules), [copy(cf) for cf in rules_list])
-                for rules, rules_list in cf_rules.items()
+                (str(key.sqref), [copy(rule) for rule in rule_list])
+                for key, rule_list in cf_rules.items()
             ]
         except Exception as e:
             log(f"读取条件格式失败（{type(e).__name__}: {e}）；将不复制条件格式", verbose)
@@ -225,9 +259,12 @@ def sort_data(headers, data_rows, rules, verbose=False):
         return []
 
     # P1-NEW-4：表头含重复列名时直接拒绝
-    if len(headers) != len(set(headers)):
+    # A-2 修复：把 None/NaN 排除后再做重复检查——合并表头场景下 P1-3 修复会保留 None 占位，
+    # pandas 会把 None 列名转成 NaN，None/NaN 在 headers 中出现多次是正常的，不应被误判为重复列名。
+    non_null_headers = [h for h in headers if h is not None and not (isinstance(h, float) and pd.isna(h))]
+    if len(non_null_headers) != len(set(non_null_headers)):
         from collections import Counter
-        dup = [v for v, c in Counter(headers).items() if c > 1]
+        dup = [v for v, c in Counter(non_null_headers).items() if c > 1]
         raise ValueError(
             f"输入表头含重复列名: {dup}。请先在源文件中重命名重复列，再调用本 skill。"
         )
@@ -241,7 +278,11 @@ def sort_data(headers, data_rows, rules, verbose=False):
     # P1-NEW-3：检测每列数据类型混合（如文本+数字），统一按文本排序并提示
     # SKILL.md 错误处理表格第 7 行承诺"统一按文本排序，并提示用户"——
     # 提示应不依赖 --verbose（用户不开 verbose 也要看到），故走 stderr
+    # A-2 修复：排除 None/NaN 列——合并表头场景下 P1-3 修复保留 None 占位，
+    # pandas 会把 None 列名转成 NaN，df[NaN] 在多个 NaN 列时返回 DataFrame，访问 .dtype 会 AttributeError。
     for col in df.columns:
+        if col is None or (isinstance(col, float) and pd.isna(col)):
+            continue
         if df[col].dtype == object:
             non_null = df[col].dropna()
             if non_null.empty:
@@ -265,7 +306,10 @@ def sort_data(headers, data_rows, rules, verbose=False):
         )
     columns = rules["columns"]
     if not isinstance(columns, list) or len(columns) == 0:
-        available = ", ".join(df.columns)
+        # A-2 修复：排除 NaN/None 列名后 join——合并表头场景下 df.columns 含 NaN float，
+        # ", ".join 时会 TypeError: sequence item 1: expected str instance, float found
+        safe_cols = [str(c) for c in df.columns if not (c is None or (isinstance(c, float) and pd.isna(c)))]
+        available = ", ".join(safe_cols)
         raise ValueError(
             f"'columns' 必须是非空列表；当前为空，将等同于不排序。可用字段: {available}"
         )
@@ -296,7 +340,9 @@ def sort_data(headers, data_rows, rules, verbose=False):
 
         col_name = col_rule["name"]
         if col_name not in df.columns:
-            available = ", ".join(df.columns)
+            # A-2 修复：排除 NaN/None 列名后 join
+            safe_cols = [str(c) for c in df.columns if not (c is None or (isinstance(c, float) and pd.isna(c)))]
+            available = ", ".join(safe_cols)
             raise ValueError(f"排序字段 '{col_name}' 不存在。可用字段: {available}")
 
         direction = col_rule.get("direction", "asc")
@@ -319,6 +365,35 @@ def sort_data(headers, data_rows, rules, verbose=False):
                 raise ValueError(
                     f"排序字段 '{col_name}' 的 custom_order 含重复值: {dup}"
                 )
+            # P1-4 修复：custom_order 元素含 None 提前拒绝
+            # pd.Categorical 在 categories 含 None 时行为未定义；co_non_str 分支的 pd.to_numeric(None)
+            # 会抛 TypeError；统一提前 ValueError 提示用户
+            if any(v is None for v in custom_order):
+                raise ValueError(
+                    f"排序字段 '{col_name}' 的 custom_order 含 None；请用字符串或显式值替代 None。"
+                )
+            # P1-2 修复：源列与 custom_order 类型不匹配时（如 int 列 + str custom_order），
+            # pd.Categorical 会把所有源值变 NaN，排序静默退化为原顺序。
+            # 防御：将源列非空值归一化为与 custom_order 元素一致的字符串形式（避免 1 vs "1" 失配）。
+            # P1-3 修复：custom_order 同时含 str 与非 str 时（如 ["低", 1, "高"]），单边归一化失败；
+            # 改为"先看混合，再走主导类型"
+            sample = df[col_name].dropna()
+            if not sample.empty:
+                co_non_str = [v for v in custom_order if not isinstance(v, str)]
+                co_str = [v for v in custom_order if isinstance(v, str)]
+                if co_non_str and co_str:
+                    # P1-3：custom_order 同时含 str 和非 str；统一把所有元素与源列转 str
+                    custom_order = [str(v) for v in custom_order]
+                    if sample.dtype != object:
+                        df[col_name] = df[col_name].astype(str)
+                elif co_non_str:
+                    # custom_order 全是非 str（如 int/float），把源列也统一到非 str
+                    if sample.dtype == object:
+                        df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+                else:
+                    # custom_order 全是 str；源列若不是 object（如 int/float/datetime），归一为 str
+                    if sample.dtype != object:
+                        df[col_name] = df[col_name].astype(str)
             # 自定义排序：将列转换为 Categorical 类型
             df[col_name] = pd.Categorical(
                 df[col_name], categories=custom_order, ordered=True
@@ -335,6 +410,11 @@ def sort_data(headers, data_rows, rules, verbose=False):
             for col in sort_columns:
                 # 自定义排序列（Categorical）不能也不需要再做大小写归一化
                 if col in custom_order_columns:
+                    actual_sort_cols.append(col)
+                    continue
+                # A-2 修复：排除 None/NaN 列——合并表头场景下 df[None] 在多个 None 列时返回 DataFrame，
+                # 访问 .dtype 会 AttributeError
+                if col is None or (isinstance(col, float) and pd.isna(col)):
                     actual_sort_cols.append(col)
                     continue
                 if df[col].dtype == object:
@@ -394,7 +474,6 @@ def write_csv(headers, data_rows, sorted_indices, output_path, verbose=False):
 def write_xlsx(headers, data_rows, sorted_indices, meta, output_path, verbose=False):
     """写入 XLSX 文件，保留原始样式"""
     import openpyxl
-    from openpyxl.utils import get_column_letter
 
     _ensure_parent_dir(output_path)
 
@@ -415,7 +494,20 @@ def write_xlsx(headers, data_rows, sorted_indices, meta, output_path, verbose=Fa
         for idx in sorted_indices:
             all_old_rows.append(old_cell_styles[idx + 1])  # 数据行（索引+1因为第0行是表头）
 
+    # P2-4：按 (new_row, col) 索引 cell.comment / cell.hyperlink，写完后回填
+    # P0-3 修复：先初始化字典，让表头循环也能写入（第 1 行参与收集）
+    new_cell_comments = {}
+    new_cell_hyperlinks = {}
+
     # 写入表头
+    # P0-3 修复：表头行也参与 comment / hyperlink 收集（之前只覆盖数据行，导致表头批注与超链接丢失）
+    # P1-1 修复：表头批注 / 超链接按 (col) 建索引，循环内 O(1) 查找，避免 O(header_count × total) 重复扫描
+    header_comments_by_col = {
+        c: payload for (r, c, payload) in old_styles.get("cell_comments", []) if r == 1
+    }
+    header_hyperlinks_by_col = {
+        c: payload for (r, c, payload) in old_styles.get("cell_hyperlinks", []) if r == 1
+    }
     for col_idx, header in enumerate(headers, start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         if old_cell_styles:
@@ -426,11 +518,14 @@ def write_xlsx(headers, data_rows, sorted_indices, meta, output_path, verbose=Fa
             cell.alignment = style["alignment"]
             cell.number_format = style["number_format"]
             cell.protection = style["protection"]
+        # P0-3：表头批注与超链接在 load_input 中已按 (row_idx=1, col, ...) 存入 styles.cell_comments / hyperlinks
+        # 表头永远在第 1 行；P1-1 修复后用预建索引 O(1) 取
+        if col_idx in header_comments_by_col:
+            new_cell_comments[(1, col_idx)] = copy(header_comments_by_col[col_idx])
+        if col_idx in header_hyperlinks_by_col:
+            new_cell_hyperlinks[(1, col_idx)] = copy(header_hyperlinks_by_col[col_idx])
 
     # 写入数据行（按排序后顺序）
-    # P2-4：按 (new_row, col) 索引 cell.comment / cell.hyperlink，写完后回填
-    new_cell_comments = {}
-    new_cell_hyperlinks = {}
     for new_row_idx, old_data_idx in enumerate(sorted_indices, start=2):
         row = data_rows[old_data_idx]
         for col_idx, cell_val in enumerate(row, start=1):
@@ -489,21 +584,21 @@ def write_xlsx(headers, data_rows, sorted_indices, meta, output_path, verbose=Fa
         if min_row == 1 and max_row == 1:
             # 只涉及表头，保持不变
             ws.merge_cells(str(merged_range))
+            # P2-1 修复：成功路径加 verbose log（之前仅失败路径 log）
+            log(f"合并区域 {merged_range} 仅涉及表头，已保留", verbose)
         elif min_row == 1 and max_row > 1:
-            # P0-2：跨表头+首行合并（如 A1:A2）；min_row=1 指向表头，max_row>1 延伸到首行数据
-            # 取 max_row-1 作为锚行（指向第一个数据行），按"连续时整体平移、否则跳过"处理
-            anchor_old_data_idx = max_row - 2
-            if anchor_old_data_idx not in old_to_new:
-                log(f"合并区域 {merged_range} 涉及越界数据行，跳过", verbose)
-                continue
+            # 跨表头+首行合并（如 A1:B2）：表头在第 1 行，"延伸"行（max_row）是首个数据行。
+            # 排序后整组数据连续平移，所以合并区应覆盖"表头 + 全部数据行"。
+            # A-2 修复：之前用 old_to_new[max_row-2] 作 new_end，丢失后续数据延伸。
             new_start = 1
-            new_end = old_to_new[anchor_old_data_idx]
-            # 平移后表头行仍在第 1 行；首行 max_row 对应到排序后的 new_end
-            if new_end >= 2:
+            new_end = 1 + len(sorted_indices)
+            # new_end >= max(max_row, 2) 时才有意义（至少延伸到原 max_row）
+            if new_end >= max(max_row, 2):
                 ws.merge_cells(
                     start_row=1, start_column=min_col,
                     end_row=new_end, end_column=max_col,
                 )
+                log(f"合并区域 {merged_range} 已平移至 1..{new_end}", verbose)
             else:
                 log(f"合并区域 {merged_range} 排序后无法定位首行，跳过", verbose)
         elif min_row > 1:
@@ -520,6 +615,7 @@ def write_xlsx(headers, data_rows, sorted_indices, meta, output_path, verbose=Fa
                     start_row=new_start, start_column=min_col,
                     end_row=new_end, end_column=max_col,
                 )
+                log(f"合并区域 {merged_range} 已平移至 {new_start}..{new_end}", verbose)
             else:
                 log(
                     f"合并区域 {merged_range} 在排序后不再连续（new {new_start}..{new_end}）"
@@ -541,17 +637,33 @@ def write_xlsx(headers, data_rows, sorted_indices, meta, output_path, verbose=Fa
             verbose,
         )
     for cf_range, cf_rules in cf_items:
-        try:
-            ws.conditional_formatting.add(cf_range, cf_rules)
-        except Exception as e:
-            log(f"条件格式 '{cf_range}' 复制失败（{type(e).__name__}: {e}）", verbose)
+        # B-1 修复：ws.conditional_formatting.add(range, cfRule) 接受单数 Rule，不是 list
+        # 之前传整个 list 触发 ValueError "Only instances of openpyxl.formatting.rule.Rule may be added"
+        # B-3 升级：失败时除 log 外还走 stderr 警告，与 DV / 命名区域 写入失败反馈对齐，
+        # 让普通 verbose 模式用户也能感知"条件格式可能不完整"
+        for cf_rule in cf_rules:
+            try:
+                ws.conditional_formatting.add(cf_range, cf_rule)
+            except Exception as e:
+                log(f"条件格式 '{cf_range}' 复制失败（{type(e).__name__}: {e}）", verbose)
+                print(
+                    f"警告: 条件格式 '{cf_range}' 复制失败（{type(e).__name__}: {e}）；"
+                    f"输出 XLSX 的条件格式可能不完整，请人工评估是否需要重新设定。",
+                    file=sys.stderr,
+                )
 
     # 复制数据验证（P1-3）
+    # P1-3 修复：失败时除 log 外还走 stderr 警告，避免用户感知不到 SKILL.md L117 "保留数据验证" 承诺的失真
     for dv in old_styles.get("data_validations", []):
         try:
             ws.add_data_validation(dv)
         except Exception as e:
             log(f"数据验证 '{dv}' 复制失败（{type(e).__name__}: {e}）", verbose)
+            print(
+                f"警告: 数据验证复制失败（{type(e).__name__}: {e}）；"
+                f"输出 XLSX 的数据验证可能不完整，请人工评估是否需要重新设定。",
+                file=sys.stderr,
+            )
 
     # 复制表格（P1-3）
     for tbl in old_styles.get("tables", []):
@@ -561,13 +673,42 @@ def write_xlsx(headers, data_rows, sorted_indices, meta, output_path, verbose=Fa
             log(f"表格 '{tbl}' 复制失败（{type(e).__name__}: {e}）", verbose)
 
     # 复制工作簿级 defined names（命名区域）（P1-3）
+    # P0-4 修复：openpyxl 3.1+ 的 DefinedNameDict 不再支持直接 __setitem__，需用 .add() / .append()
+    # 此处统一走 .add()；老版本无 .add() 时回退到 __setitem__；双重 try/except 兜底
+    # P1-4 修复：失败时除 log 外还走 stderr 警告，main() 拿不到失败信号的旧问题
     src_wb = meta.get("workbook")
     if src_wb is not None:
         for name, defn in src_wb.defined_names.items():
+            copied = False
             try:
-                wb.defined_names[name] = defn
+                wb.defined_names.add(defn)
+                copied = True
+            except (AttributeError, TypeError):
+                # 老 API：defined_names 是 dict-like，可直接 __setitem__
+                try:
+                    wb.defined_names[name] = defn
+                    copied = True
+                except Exception as e2:
+                    log(f"命名区域 '{name}' 回退复制失败（{type(e2).__name__}: {e2}）", verbose)
+                    print(
+                        f"警告: 命名区域 '{name}' 复制失败（{type(e2).__name__}: {e2}）；"
+                        f"输出 XLSX 中引用此命名区域的公式可能 #REF!，请人工评估。",
+                        file=sys.stderr,
+                    )
             except Exception as e:
                 log(f"命名区域 '{name}' 复制失败（{type(e).__name__}: {e}）", verbose)
+                print(
+                    f"警告: 命名区域 '{name}' 复制失败（{type(e).__name__}: {e}）；"
+                    f"输出 XLSX 中引用此命名区域的公式可能 #REF!，请人工评估。",
+                    file=sys.stderr,
+                )
+            if not copied:
+                log(f"命名区域 '{name}' 未能复制（API 兼容性原因）", verbose)
+                print(
+                    f"警告: 命名区域 '{name}' 未能复制（API 兼容性原因）；"
+                    f"输出 XLSX 中引用此命名区域的公式可能 #REF!，请人工评估。",
+                    file=sys.stderr,
+                )
 
     wb.save(output_path)
     log(f"XLSX 输出完成: {output_path}", verbose)
@@ -580,9 +721,10 @@ def main():
     log(f"输入: {args.input}", verbose)
     log(f"输出: {args.output}", verbose)
 
-    # P0-NEW-2：--format 显式传入时，与 --output 扩展名必须一致；否则报错
+    # P0-NEW-2 + P1-5：--format 显式传入时，与 --output 扩展名必须一致；否则报错。
+    # P1-5 修复：detect_format 三处重复调用（L625 之后 + L660 空文件路径 + L689 写入路径）合并为单一 out_fmt 变量
+    out_ext = Path(args.output).suffix.lower()
     if args.format is not None:
-        out_ext = Path(args.output).suffix.lower()
         expected_ext = f".{args.format}"
         # .xlsm 在 detect_format 中归并为 xlsx，但用户传 --format 时仍按字面 .xlsm 校验
         if out_ext not in (expected_ext, ".xlsm" if args.format == "xlsx" else ""):
@@ -593,6 +735,9 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
+
+    # P1-5：提前解析输出格式供后续三处复用，避免 detect_format 三次调用
+    out_fmt = detect_format(args.output, args.format)
 
     # 解析排序规则
     try:
@@ -607,13 +752,14 @@ def main():
     try:
         headers, data_rows, meta = load_input(args.input, args.sheet, verbose)
     except Exception as e:
+        # P1-4 修复：保留 traceback，方便 AI / 用户排查
+        traceback.print_exc(file=sys.stderr)
         print(f"错误: 加载输入文件失败 - {e}", file=sys.stderr)
         sys.exit(1)
 
     if not headers:
         print("警告: 输入文件为空，输出空文件", file=sys.stderr)
         # 写入空文件
-        out_fmt = detect_format(args.output, args.format)
         if out_fmt == "csv":
             write_csv([], [], [], args.output, verbose)
         else:
@@ -634,19 +780,22 @@ def main():
     try:
         sorted_indices = sort_data(headers, data_rows, rules, verbose)
     except Exception as e:
+        # P1-4 修复：保留 traceback
+        traceback.print_exc(file=sys.stderr)
         print(f"错误: 排序失败 - {e}", file=sys.stderr)
         sys.exit(1)
 
     log(f"排序完成，行顺序: {sorted_indices[:10]}{'...' if len(sorted_indices) > 10 else ''}", verbose)
 
-    # 输出
-    out_fmt = detect_format(args.output, args.format)
+    # 输出（P1-5：复用前面解析的 out_fmt，不再二次调用 detect_format）
     try:
         if out_fmt == "csv":
             write_csv(headers, data_rows, sorted_indices, args.output, verbose)
         else:
             write_xlsx(headers, data_rows, sorted_indices, meta, args.output, verbose)
     except Exception as e:
+        # P1-4 修复：保留 traceback
+        traceback.print_exc(file=sys.stderr)
         print(f"错误: 输出失败 - {e}", file=sys.stderr)
         sys.exit(1)
 

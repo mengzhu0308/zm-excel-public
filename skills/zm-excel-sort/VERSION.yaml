@@ -3,3 +3,5 @@ skill_info:
   version: 0.1.3
   description: "对 Excel 或 CSV 文件按指定字段规则进行排序，支持多字段排序、升序/降序、数据类型自动识别、自定义排序顺序"
   category: 工作流
+metadata:
+  skill_mode: hybrid

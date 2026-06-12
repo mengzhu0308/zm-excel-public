@@ -1,7 +1,7 @@
 ---
 name: zm-excel-sort
 description: >-
-  对 Excel/CSV 文件按指定字段规则排序。支持多字段排序、升序/降序、数据类型自动识别、自定义排序顺序。输出为 CSV 或 XLSX，XLSX 完整保留原始单元格样式（字体、填充、边框、对齐、列宽、行高、合并单元格、冻结窗口、数据验证[按当前坐标复制，排序后 sqref 引用可能错位]、条件格式[基于固定区域，排序后可能错位]）。
+  对 Excel/CSV 文件按指定字段规则排序。支持多字段排序、升序/降序、数据类型自动识别、自定义排序顺序。输出为 CSV 或 XLSX，XLSX 完整保留原始单元格样式（字体、填充、边框、对齐、列宽、行高、合并单元格、冻结窗口[按当前坐标复制，排序后引用可能错位]、表格[按当前坐标复制，排序后引用可能错位]、命名区域[按当前坐标复制，排序后引用可能错位]、数据验证[按当前坐标复制，排序后 sqref 引用可能错位]、条件格式[基于固定区域，排序后可能错位]）。
 
   当用户要求对 Excel/CSV/XLSX 数据进行排序（按某列排、从高到低、整理顺序、把某类放前面等）时，**务必优先使用此 skill**。
 
@@ -10,6 +10,7 @@ description: >-
   **输入限制**：仅支持 .xlsx / .xlsm / .csv。.xls 不在本 skill 支持范围内（openpyxl 限制），请先在 Excel/WPS/LibreOffice 中另存为 .xlsx 再调用。
 metadata:
   skill_mode: hybrid
+  version: 0.1.3
 compatibility:
   runtime:
     - name: agent-skills
@@ -39,7 +40,7 @@ compatibility:
 ### 输入文件
 
 1. **Excel**（`.xlsx` / `.xlsm`）：需指定 Sheet 名称或索引（默认第 1 个）。注意：本 skill 不支持 `.xls`（openpyxl 限制）
-2. **CSV**（`.csv`）：编码自动检测，优先 UTF-8，失败时回退常见中文编码；检测结果会回显到 stderr
+2. **CSV**（`.csv`）：编码自动检测，优先 UTF-8，失败时回退常见中文编码；仅在 `latin1` 兜底时强制 stderr 提示乱码风险，正常编码在 `--verbose` 模式回显到 stderr
 
 ### 排序规则
 
@@ -67,6 +68,8 @@ compatibility:
 | "先按地区升序，再按销售额降序" | `[{"name":"地区","direction":"asc"},{"name":"销售额","direction":"desc"}]` |
 | "按状态：待处理→处理中→已完成" | `[{"name":"状态","direction":"asc","custom_order":["待处理","处理中","已完成"]}]` |
 
+> **边界行为**：未在 `custom_order` 列表中的值，按 pandas Categorical 默认行为排在已定义值之后（即 NaN/未分类值统一置后，且不影响其他字段排序）。若需要在自定义顺序中包含所有可能值，应将所有取值显式列入 `custom_order` 列表。
+
 #### 字段名匹配
 
 - AI 层（`agents/openai.yaml` 描述）负责字段名模糊匹配（如 "销售额" 可匹配 "销售金额"）
@@ -80,10 +83,10 @@ compatibility:
 将自然语言需求转为结构化 JSON。需确认：
 
 - 目标字段是否存在（模糊匹配）
-- 排序方向是否明确（未明确默认升序）
+- 排序方向是否明确（未明确时先向用户确认，不擅自默认升序）
 - 是否有自定义排序需求、空值位置偏好
 
-规则存在歧义时先向用户确认，不擅自决定。
+规则存在歧义时先向用户确认，不擅自决定——与 `agents/openai.yaml` system 段"排序规则未明确或存在歧义时先向用户确认"口径一致。
 
 ### 步骤 2：调用排序脚本
 
@@ -97,6 +100,8 @@ conda run -n agent-skills python "$SKILL_DIR/scripts/sort_excel.py" \
 ```
 
 > 上述命令使用统一的 `agent-skills` runtime：`conda run -n agent-skills python "$SKILL_DIR/scripts/sort_excel.py"` —— 该环境已预装 `openpyxl` 与 `pandas`。
+
+**输出格式**默认从 `--output` 扩展名推断（`.csv` → csv；`.xlsx` / `.xlsm` → xlsx）；仅在显式需要时使用 `--format`，且传入值必须与扩展名一致（冲突时脚本报 `ValueError` 并退出）。如需将 XLSX 强制输出为 CSV（或反之），请改写 `--output` 路径的扩展名，去掉 `--format` 让脚本按扩展名自动推断。
 
 ### 步骤 3：验证结果
 
@@ -136,7 +141,7 @@ conda run -n agent-skills python "$SKILL_DIR/scripts/sort_excel.py" \
 | 排序规则 JSON 解析失败 | 报错并保留原始 json 错误信息 |
 | 排序规则 schema 错误（缺 `columns`、`columns=[]`、非法 `direction`、非布尔 `case_sensitive`、非法 `null_position`） | 提前拒绝并打印明确错误 |
 | `custom_order` 含重复值 | 提前拒绝并指出重复值 |
-| 数据类型混合（如文本和数字混在同一列） | 统一按文本排序，并通过 stderr 提示用户 |
+| 数据类型混合（如文本和数字混在同一列） | 走 pandas object 列默认排序（字典序），并通过 stderr 提示用户——脚本不显式做类型转换，行为取决于 pandas |
 | CSV 字段以 `=` / `+` / `-` / `@` / Tab / CR 开头 | 写入时自动加 `'` 前缀，避免 Excel/WPS 打开时被强制执行公式 |
 | 排序执行失败 | 报错并保留原始异常信息 |
 | 输出写入失败 | 报错并保留原始异常信息 |

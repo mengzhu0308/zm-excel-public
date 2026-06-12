@@ -22,32 +22,41 @@ except ImportError as e:
 
 # 从 VERSION.yaml 读取 skill 版本号；失败时回退到硬编码值。
 def _load_skill_version() -> str:
-    """优先从同目录的 VERSION.yaml 读取 skill_info.version；失败回退硬编码。"""
+    """优先从同目录的 VERSION.yaml 读取 skill_info.version；缺失或无法解析时抛 RuntimeError。
+
+    A-1 P1-3: 之前回退到硬编码 "0.3.0" 会与 VERSION.yaml 漂移；改为显式抛错。
+    包裹层 __version__ 在 import 时 try/except，配置错误时 --version 显示 "unknown"
+    提示用户检查 VERSION.yaml，主流程不中断。
+    """
     try:
         import yaml  # PyYAML；缺则降级到正则
     except ImportError:
         yaml = None
     version_yaml = Path(__file__).resolve().parent.parent / "VERSION.yaml"
-    if version_yaml.exists():
-        try:
-            if yaml is not None:
-                with open(version_yaml, "r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
-                v = (data.get("skill_info") or {}).get("version")
-                if v:
-                    return str(v)
-            else:
-                # 降级：正则匹配 `version: 0.2.0`
-                text = version_yaml.read_text(encoding="utf-8")
-                m = re.search(r"^\s*version:\s*['\"]?([0-9A-Za-z.\-_]+)", text, re.MULTILINE)
-                if m:
-                    return m.group(1)
-        except Exception:
-            pass
-    return "0.3.0"  # 与 CHANGELOG 同步的硬编码回退
+    if not version_yaml.exists():
+        raise RuntimeError(f"VERSION.yaml 缺失: {version_yaml}")
+    try:
+        if yaml is not None:
+            with open(version_yaml, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            v = (data.get("skill_info") or {}).get("version")
+            if v:
+                return str(v)
+        else:
+            # 降级：正则匹配 `version: 0.2.0`
+            text = version_yaml.read_text(encoding="utf-8")
+            m = re.search(r"^\s*version:\s*['\"]?([0-9A-Za-z.\-_]+)", text, re.MULTILINE)
+            if m:
+                return m.group(1)
+    except Exception as e:
+        raise RuntimeError(f"无法解析 VERSION.yaml: {e}") from e
+    raise RuntimeError(f"VERSION.yaml 缺少 skill_info.version: {version_yaml}")
 
 
-__version__ = _load_skill_version()
+try:
+    __version__ = _load_skill_version()
+except RuntimeError:
+    __version__ = "unknown"  # 配置错误时 --version 提示 unknown；主流程不中断
 
 
 def _write_output(df, path, fmt='csv'):
@@ -80,11 +89,11 @@ def _read_input(input_path, sheet=None, header=0):
         return pd.read_excel(input_path, engine='openpyxl', header=header, sheet_name=sheet)
     if suffix == '.xls':
         return pd.read_excel(input_path, engine='xlrd', header=header, sheet_name=sheet)
-    # 未知后缀：先按 xlsx 试，失败再按 csv 试
-    try:
-        return pd.read_excel(input_path, engine='openpyxl', header=header, sheet_name=sheet)
-    except Exception:
-        return pd.read_csv(input_path, header=header)
+    # A-1 P0-3: 未知后缀不再静默 fallback（之前 except Exception 双 try
+    # 会把 .txt/.json/无后缀 的真实错误掩盖成 CSV 解析错误）。显式拒绝并提示。
+    raise ValueError(
+        f"不支持的文件格式: {suffix!r}（支持: .csv / .xlsx / .xlsm / .xls）"
+    )
 
 
 def _ensure_unique(path):
@@ -102,13 +111,16 @@ def _ensure_unique(path):
         counter += 1
 
 
-# 显式优先级表：列表顺序即"低 → 高"绑定强度。
-# 当前实现里先尝试 `or` 切分意味着 `and` 绑定更紧（与 Python / pandas 一致）。
+# 显式优先级表：列表顺序即"高 → 低"绑定强度（先切 = 绑定更松）。
+# 先尝试 `and` 切分意味着 `or` 绑定更松（`A and B or C and D` → `(A and B) or (C and D)`）；
+# 与 Python / pandas.DataFrame.query() 默认语义一致。
 # 用列表而非 if-elif-else 是为了未来扩展更直观。
 # 改顺序前请同步更新 references/where-expression.md 与 _artifacts/precedence_test.py。
+# A-2 P1-3: 列表顺序由"低→高"改为"高→低"，与文档 where-expression.md 中
+# "从高到低" 阅读顺序对齐，新读者不再被反序索引误导。
 _PRECEDENCE: list[tuple[str, str, "operator"]] = [
-    (' or ', '|', operator.or_),
     (' and ', '&', operator.and_),
+    (' or ', '|', operator.or_),
 ]
 
 
@@ -161,7 +173,13 @@ def _fmt_dtype(dtype):
 
 
 def preview_data(df, n=10, title=None):
-    """打印 DataFrame 的预览信息：前 N 行 + 字段元信息。"""
+    """打印 DataFrame 的预览信息：前 N 行 + 字段元信息。
+
+    A-2 P1-1: n 必须为非负整数；负数会被 pandas 解释为"除最后 |n| 行外全部"，
+    与用户直觉相反（与 A-1 P1-7 同源修复）。
+    """
+    if n < 0:
+        raise ValueError(f"preview 行数不能为负数: {n}")
     lines = []
     if title:
         lines.append(f"\n{'=' * 60}")
@@ -341,26 +359,43 @@ def interactive_mode(input_path, df, sheet_name=None, fmt='csv'):
 
         elif cmd == 'limit':
             try:
-                state['limit'] = int(args)
-                print(f"   ✓ 行数限制已设置: {args}")
+                v = int(args)
             except ValueError:
                 print("   ✗ limit 参数必须是整数")
+                continue
+            # A-1 P1-7: 与 CLI _apply_pipeline 一致；负数立即拦截而非延后到 run。
+            if v < 0:
+                print(f"   ✗ limit 不能为负数: {v}")
+                continue
+            state['limit'] = v
+            print(f"   ✓ 行数限制已设置: {v}")
 
         elif cmd == 'offset':
             try:
-                state['offset'] = int(args)
-                print(f"   ✓ 偏移量已设置: {args}")
+                v = int(args)
             except ValueError:
                 print("   ✗ offset 参数必须是整数")
+                continue
+            if v < 0:
+                print(f"   ✗ offset 不能为负数: {v}")
+                continue
+            state['offset'] = v
+            print(f"   ✓ 偏移量已设置: {v}")
 
         elif cmd == 'reset':
             state = {k: None for k in state}
             print("   ✓ 所有查询条件已重置")
+            # A-1 P1-8: reset 后提示当前 sheet，避免多 sheet 模式下"上一张 sheet
+            # 的 query" 与 "当前 sheet" 边界模糊。
+            if sheet_name:
+                print(f"   当前 sheet: {sheet_name}")
 
         elif cmd == 'run':
             result_df, error = _apply_query(df, state)
             if error:
-                print(f"   ✗ 查询错误: {error}")
+                # A-3 P2-1: 透传 _apply_pipeline_safe 分类字符串（用户错误 vs 内部错误），
+                # 与 CLI query_excel 入口的"参数或输入错误" / "内部错误"口径对齐。
+                print(f"   ✗ {error}")
                 continue
 
             print(f"\n📄 查询结果（共 {len(result_df)} 行）")
@@ -378,10 +413,17 @@ def interactive_mode(input_path, df, sheet_name=None, fmt='csv'):
         elif cmd == 'save':
             result_df, error = _apply_query(df, state)
             if error:
-                print(f"   ✗ 查询错误: {error}")
+                # A-3 P2-1: 同上，透传分类字符串。
+                print(f"   ✗ {error}")
                 continue
 
             if args:
+                # A-1 P0-1: 交互模式 save 路径与 CLI -o 同语义；用户输入 `save ../escape.csv`
+                # 会越界到父目录写文件。`save` 与 CLI --tag 同源风险但语义不同（-o 是完整路径），
+                # 这里只拦截路径穿越 `..` 而非字符白名单（`/` 是合法目录分隔符）。
+                if '..' in Path(args).parts:
+                    print(f"   ✗ save 路径不允许包含 '..'；非法: {args!r}")
+                    continue
                 out_path = Path(args)
             else:
                 suffix = '.xlsx' if fmt == 'xlsx' else '.csv'
@@ -396,8 +438,13 @@ def interactive_mode(input_path, df, sheet_name=None, fmt='csv'):
             try:
                 _write_output(result_df, out_path, fmt)
                 print(f"   ✓ 结果已保存: {out_path}")
+            except (OSError, ValueError) as e:
+                # A-3 P2-1: 写文件错误也用"参数或输入错误"分类，与 CLI 对齐。
+                print(f"   ✗ 参数或输入错误: 保存失败: {e}")
             except Exception as e:
-                print(f"   ✗ 保存失败: {e}")
+                # 内部错误附 traceback，与 query_excel 入口一致。
+                import traceback
+                print(f"   ✗ 内部错误: 保存失败: {e}\n{traceback.format_exc()}")
 
         else:
             print(f"   ✗ 未知命令: {cmd}，输入 'help' 查看可用命令")
@@ -406,72 +453,84 @@ def interactive_mode(input_path, df, sheet_name=None, fmt='csv'):
 def _apply_pipeline(df, params):
     """统一的查询管线：where / exclude / select / distinct / groupby+agg / sort / offset / limit。
 
-    一次性查询（_query_single）与交互模式（_apply_query）共用同一管线，
-    保证两边行为一致。
+    A-2 P0-2: 异常透传给外层 caller，不在内部做 (df, error) 包装。
+    一次性查询（_query_single）→ query_excel 入口 try/except 分类；
+    交互模式（_apply_query）→ _apply_query_safe 包装为 (df, error) 元组。
 
-    错误处理分两类：
-    - 用户错误（ValueError / KeyError / FileNotFoundError / LookupError）：
-      返回 (None, "参数错误: <msg>")；
-    - 内部错误（其余 Exception）：返回 (None, "内部错误: <msg>")，
-      调试时可访问 result["traceback"] 字段。
+    这样外层 query_excel 才能按异常类型正确分类"用户错误"与"内部错误"，
+    避免之前 _query_single 把已分类 error 包成 RuntimeError 重抛后
+    外层只能走"内部错误"分支、双层包装的 bug。
     """
+    # 入口处统一校验 select / exclude / distinct / groupby 引用的列
+    # 是否都存在；typo 的列名应被显式拒绝，而不是 silent drop。
+    # A-2 P0-3: sort 推迟到 groupby+agg 之后再校验，因为聚合后才会出现
+    # `salary_mean` / `count_name` 这类新列。
+    _validate_columns(params, df)
+
+    # limit / offset 负数校验：A-3 P1-2 修复。
+    # pandas 默认行为 `df.head(-1)` 返回除最后一行外全部，`iloc[:-5]` 跳过最后 5 行，
+    # 与用户预期相反，必须显式拦截。
+    if params.get('limit') is not None and int(params['limit']) < 0:
+        raise ValueError(f"--limit 不能为负数: {params['limit']}")
+    if params.get('offset') is not None and int(params['offset']) < 0:
+        raise ValueError(f"--offset 不能为负数: {params['offset']}")
+
+    result = df.copy()
+
+    if params.get('where'):
+        mask = parse_where(params['where'], result)
+        result = result[mask]
+
+    if params.get('exclude'):
+        exclude_cols = [c.strip() for c in params['exclude'].split(',')]
+        # _validate_columns 已保证所有 exclude 列存在，直接 drop。
+        result = result.drop(columns=exclude_cols, errors='ignore')
+
+    if params.get('select'):
+        cols = [c.strip() for c in params['select'].split(',')]
+        # _validate_columns 已保证所有 select 列存在，直接索引。
+        result = result[cols]
+
+    if params.get('distinct'):
+        cols = [c.strip() for c in params['distinct'].split(',')]
+        # _validate_columns 已保证所有 distinct 列存在。
+        result = result.drop_duplicates(subset=cols)
+
+    if params.get('groupby'):
+        group_cols = [c.strip() for c in params['groupby'].split(',')]
+        # _validate_columns 已保证所有 groupby 列存在。
+        if group_cols and params.get('agg'):
+            agg_dict = parse_agg(params['agg'])
+            # A-3 P0-1: 命名聚合 kwargs 模式让 groupby 产出
+            # `salary_mean` / `count_name` 这种 `<col>_<func>` 形式的列名，
+            # 与 SKILL.md / README 文档承诺一致；之前用 agg(dict) 模式
+            # 列名是 `salary`（无 `_func` 后缀），与文档不符。
+            result = result.groupby(group_cols).agg(**agg_dict).reset_index()
+
+    # A-2 P0-3: sort 列名校验推迟到 groupby+agg 之后，使用 result.columns
+    # （聚合后才会出现 salary_mean / count_name 这类新列）。
+    if params.get('sort'):
+        sort_cols, ascending = parse_sort(params['sort'])
+        _validate_sort_columns(params['sort'], result)
+        result = result.sort_values(by=sort_cols, ascending=ascending)
+
+    # offset / limit 必须用 is not None 判断：0 是合法值（offset=0 等于不偏移，limit=0 要求 0 行）
+    if params.get('offset') is not None:
+        result = result.iloc[int(params['offset']):]
+
+    if params.get('limit') is not None:
+        result = result.head(int(params['limit']))
+
+    return result
+
+
+def _apply_pipeline_safe(df, params):
+    """A-2 P0-2: 交互模式包装层。把 _apply_pipeline 的异常转为 (df, error) 元组，
+    让交互循环能打印错误并继续接收下一条命令，而不是崩出整个 --interactive 会话。
+    错误分类语义与 query_excel 入口一致：用户错误 vs 内部错误（带 traceback）。"""
     try:
-        # 入口处统一校验 select / exclude / sort / distinct / groupby 引用的列
-        # 是否都存在；typo 的列名应被显式拒绝，而不是 silent drop。
-        _validate_columns(params, df)
-
-        # limit / offset 负数校验：A-3 P1-2 修复。
-        # pandas 默认行为 `df.head(-1)` 返回除最后一行外全部，`iloc[:-5]` 跳过最后 5 行，
-        # 与用户预期相反，必须显式拦截。
-        if params.get('limit') is not None and int(params['limit']) < 0:
-            raise ValueError(f"--limit 不能为负数: {params['limit']}")
-        if params.get('offset') is not None and int(params['offset']) < 0:
-            raise ValueError(f"--offset 不能为负数: {params['offset']}")
-
-        result = df.copy()
-
-        if params.get('where'):
-            mask = parse_where(params['where'], result)
-            result = result[mask]
-
-        if params.get('exclude'):
-            exclude_cols = [c.strip() for c in params['exclude'].split(',')]
-            # A-3 P1-7：_validate_columns 已保证所有 exclude 列存在，直接 drop。
-            result = result.drop(columns=exclude_cols, errors='ignore')
-
-        if params.get('select'):
-            cols = [c.strip() for c in params['select'].split(',')]
-            # A-3 P1-7：_validate_columns 已保证所有 select 列存在，直接索引。
-            result = result[cols]
-
-        if params.get('distinct'):
-            cols = [c.strip() for c in params['distinct'].split(',')]
-            # A-3 P1-7：_validate_columns 已保证所有 distinct 列存在。
-            result = result.drop_duplicates(subset=cols)
-
-        if params.get('groupby'):
-            group_cols = [c.strip() for c in params['groupby'].split(',')]
-            # A-3 P1-7：_validate_columns 已保证所有 groupby 列存在。
-            if group_cols and params.get('agg'):
-                agg_dict = parse_agg(params['agg'])
-                # A-3 P1-7：_validate_columns 已保证所有 agg 列存在。
-                result = result.groupby(group_cols).agg(agg_dict).reset_index()
-
-        if params.get('sort'):
-            sort_cols, ascending = parse_sort(params['sort'])
-            # A-3 P1-7：_validate_columns 已保证所有 sort 列存在。
-            result = result.sort_values(by=sort_cols, ascending=ascending)
-
-        # offset / limit 必须用 is not None 判断：0 是合法值（offset=0 等于不偏移，limit=0 要求 0 行）
-        if params.get('offset') is not None:
-            result = result.iloc[int(params['offset']):]
-
-        if params.get('limit') is not None:
-            result = result.head(int(params['limit']))
-
-        return result, None
-    except (ValueError, KeyError, FileNotFoundError, LookupError) as e:
-        # 用户错误：清晰提示，不暴露内部栈
+        return _apply_pipeline(df, params), None
+    except (ValueError, KeyError, FileNotFoundError) as e:
         return None, f"参数或输入错误: {e}"
     except Exception as e:
         # 内部错误：保留 traceback 供调试
@@ -480,8 +539,8 @@ def _apply_pipeline(df, params):
 
 
 def _apply_query(df, state):
-    """交互模式入口：把 state 灌进统一管线。"""
-    return _apply_pipeline(df, state)
+    """交互模式入口：把 state 灌进统一管线，异常包装为 (df, error) 元组。"""
+    return _apply_pipeline_safe(df, state)
 
 
 def parse_where(expr, df):
@@ -496,11 +555,21 @@ def parse_where(expr, df):
 
 
 def _parse_where(expr, df, masks):
-    """递归解析 where 条件。masks 存储括号展开后的中间 mask。"""
+    """递归解析 where 条件。masks 存储括号展开后的中间 mask 与字符串字面量占位符。"""
     if not expr:
         return pd.Series([True] * len(df), index=df.index)
 
     expr = expr.strip()
+
+    # A-2 P0-1: 字符串字面量保护。先识别 '...' / "..." 用占位符替换，
+    # 避免 _PRECEDENCE 切 ' or ' / ' and ' 时把字符串内的 ' or ' / ' and ' 错切
+    # （典型场景：name == 'a or b'、name contains 'foo and bar'）。
+    # 占位符与括号占位符复用同一个 masks 字典；解析时一并还原。
+    str_re = re.compile(r"'[^']*'|\"[^\"]*\"")
+    for m in reversed(list(str_re.finditer(expr))):
+        placeholder = f"__STR_{len(masks)}__"
+        masks[placeholder] = m.group(0)
+        expr = expr[:m.start()] + placeholder + expr[m.end():]
 
     # 括号优先：把最内层括号替换为占位符
     while '(' in expr:
@@ -513,7 +582,7 @@ def _parse_where(expr, df, masks):
         expr = (expr[:match.start()] + placeholder + expr[match.end():]).strip()
 
     # and / or：显式优先级表，按 _PRECEDENCE 顺序切分。
-    # 列表低位运算符（or）先切 → 高位运算符（and）绑定更紧；
+    # 列表顺序即优先级从高到低（高优先级先切 = 绑定更松）。
     # 与 Python / pandas.DataFrame.query() 默认语义一致。
     # A-3 P1-3: 大小写不敏感，AND/OR/And/Or 等都按同一运算符处理。
     for op_token, _, op_func in _PRECEDENCE:
@@ -534,7 +603,13 @@ def _parse_where(expr, df, masks):
         if op in expr:
             left, right = expr.split(op, 1)
             left = left.strip().strip('"\'')
-            right = right.strip().strip('"\'')
+            right = right.strip()
+            # A-2 P0-1: 还原字符串字面量占位符；占位符不在 masks 时
+            # 退回剥离外层引号的旧行为（保持向后兼容）。
+            if right in masks:
+                right = masks[right]
+            else:
+                right = right.strip('"\'')
             if left not in df.columns:
                 avail = ', '.join(f'{c!r}' for c in df.columns)
                 raise KeyError(
@@ -603,29 +678,19 @@ def _validate_columns(params, df):
     # groupby 单独走一次
     _check_list('groupby')
 
-    # sort 的每个 part 取首 token 作为列名
-    sort_val = params.get('sort')
-    if sort_val:
-        sort_cols = []
-        for part in sort_val.split(','):
-            part = part.strip()
-            if not part:
-                continue
-            tokens = part.split()
-            sort_cols.append(tokens[0])
-        missing = [c for c in sort_cols if c not in valid]
-        if missing:
-            avail = ', '.join(f'{c!r}' for c in valid)
-            raise ValueError(
-                f"--sort 引用了不存在的列: {missing}；可用列: [{avail}]"
-            )
+    # A-2 P0-3: sort 列名校验推迟到 groupby+agg 之后。
+    # 原因：聚合后才会出现 `salary_mean` / `count_name` 这类新列，
+    # 用原始 df.columns 校验会误拒绝合法 sort。sort 校验逻辑搬到
+    # `_validate_sort_columns` 与管线 groupby+agg 之后。
 
     # agg 的 col 字段也必须存在
     agg_val = params.get('agg')
     if agg_val:
-        # parse_agg 已校验 func/col 非空，这里只校验 col 是否在 DataFrame 中
+        # parse_agg 返回 {output_name: pd.NamedAgg(col, func)}，
+        # 原始 col 在 NamedAgg.column；校验 DataFrame 是否有这些 col。
         agg_dict = parse_agg(agg_val)
-        missing = [c for c in agg_dict.keys() if c not in valid]
+        agg_cols = [na.column for na in agg_dict.values()]
+        missing = [c for c in agg_cols if c not in valid]
         if missing:
             avail = ', '.join(f'{c!r}' for c in valid)
             raise ValueError(
@@ -653,8 +718,38 @@ def parse_sort(sort_str):
     return cols, orders
 
 
+def _validate_sort_columns(sort_str, df):
+    """A-2 P0-3: sort 列名校验推迟到 groupby+agg 之后，使用 result.columns。
+
+    与 `_validate_columns` 内被搬走的 sort 校验逻辑等价，但接受外部 df
+    参数（聚合后的 DataFrame），让 sort 引用 `salary_mean` / `count_name`
+    这类新列成为合法。
+    """
+    if not sort_str:
+        return
+    valid = set(df.columns)
+    sort_cols = []
+    for part in sort_str.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        tokens = part.split()
+        sort_cols.append(tokens[0])
+    missing = [c for c in sort_cols if c not in valid]
+    if missing:
+        avail = ', '.join(f'{c!r}' for c in valid)
+        raise ValueError(
+            f"--sort 引用了不存在的列: {missing}；可用列: [{avail}]"
+        )
+
+
 def parse_agg(agg_str):
     """解析聚合字符串，如 'sum:salary,count:name,mean:age'。
+
+    返回**命名聚合 kwargs dict**：`{f"{col}_{func}": pd.NamedAgg(column=col, aggfunc=func)}`。
+    配套 `_apply_pipeline` 的 `df.groupby(...).agg(**agg_dict)` 会产出
+    `salary_mean` / `count_name` 这类与 SKILL.md / README 文档承诺一致的
+    列名（之前用 `agg(dict)` 模式时列名是 `salary`，与文档不符——A-3 P0-1）。
 
     校验：每段必须包含 `:`，且 func 与 col 都非空；空 func / 空 col 视为
     畸形条目并抛 `ValueError`，避免后续 groupby 拿到垃圾字典。
@@ -673,7 +768,14 @@ def parse_agg(agg_str):
         col = col.strip()
         if not func or not col:
             raise ValueError(f"agg 条目 func 或 col 为空: {part!r}")
-        result[col] = func
+        # A-1 P1-2: 检测重复 col；之前字典赋值会静默覆盖，多半是用户笔误。
+        # 改成命名聚合后，重复检测改为"重复输出列名"以匹配实际行为。
+        out_name = f"{col}_{func}"
+        if out_name in result:
+            raise ValueError(
+                f"agg 重复列: {out_name!r}（已映射到 {result[out_name]!r}，又指定 {func!r}）"
+            )
+        result[out_name] = pd.NamedAgg(column=col, aggfunc=func)
     return result
 
 
@@ -685,6 +787,12 @@ def query_excel(input_path, sheet=None, header=0, where=None, select=None,
 
     if not Path(input_path).exists():
         return {"error": f"文件不存在: {input_path}"}
+
+    # B-2: CLI `--output` 与交互模式 `save <path>` 同语义；`save` 已拦截 `..` 越界
+    # 写父目录（A-1 P0-1 修复），但 CLI `--output` 留了一个口子。`--output ../escape.csv`
+    # 会越界到父目录写文件。在入口处对称拦截，错误信息走"参数或输入错误"分类。
+    if output and '..' in Path(output).parts:
+        return {"error": f"参数或输入错误: --output 路径不允许包含 '..': {output!r}"}
 
     # A-3 P2-3: 运行时只读保护 - 入口对 input_path 做 stat 快照，
     # 调度结束后再 stat 一次；若 mtime / size 改变则抛 RuntimeError，
@@ -698,17 +806,26 @@ def query_excel(input_path, sheet=None, header=0, where=None, select=None,
     # 整个 read → preview/interactive/_query_single 流程统一 try/except，
     # 保证下游错误（KeyError、空 mask 解析、_query_single 抛错）都转为 {"error": ...}，
     # 避免 Python traceback 一路暴露到 CLI。
+    # A-1 P0-2: 异常分类上提到入口；用户错误归"参数或输入错误"，
+    # 其余内部错误附 traceback（与 _apply_pipeline 已有口径保持一致）。
+    # LookupError 在 pandas 实际抛出场景里几乎不存在，参见 A-1 P1-1 移除。
     try:
         df = _read_input(input_path, sheet=sheet, header=header)
+    except (ValueError, KeyError, FileNotFoundError) as e:
+        return {"error": f"参数或输入错误: {e}"}
     except Exception as e:
-        return {"error": f"读取输入失败: {e}"}
+        import traceback
+        return {"error": f"内部错误: 读取输入失败: {e}\n{traceback.format_exc()}"}
 
     try:
         result = _query_excel_dispatch(df, input_path, sheet, where, select, sort,
                                        distinct, groupby, agg, limit, offset,
                                        output, tag, fmt, preview, interactive, exclude)
+    except (ValueError, KeyError, FileNotFoundError) as e:
+        return {"error": f"参数或输入错误: {e}"}
     except Exception as e:
-        return {"error": f"查询失败: {e}"}
+        import traceback
+        return {"error": f"内部错误: 查询失败: {e}\n{traceback.format_exc()}"}
 
     # 出口 stat 校验
     try:
@@ -738,7 +855,11 @@ def _query_excel_dispatch(df, input_path, sheet, where, select, sort,
 
     # 多 sheet 处理
     if isinstance(df, dict):
-        if preview:
+        # A-2 P1-2: 用 `is not None` 判 `--preview` 而非 `if preview:`，
+        # 避免 `--preview 0` 落入 Python falsy 陷阱（应走 preview 分支预览 0 行，
+        # 而不是走 _query_single 写文件）。A-1 已对 `--limit` / `--offset` 负数
+        # 做入口校验；这里把 falsy 边界补齐。
+        if preview is not None:
             # 多 sheet + --json --preview：每个 sheet 仍走完整 preview，
             # 但每个 sheet 的 preview 文本只保留 5 行样本 + 字段信息，
             # 避免 JSON 输出体量爆炸。完整 preview 仍可通过普通 CLI 输出查看。
@@ -767,7 +888,9 @@ def _query_excel_dispatch(df, input_path, sheet, where, select, sort,
         return {"success": True, "output_files": results}
 
     # 单 sheet 处理
-    if preview:
+    # A-2 P1-2: 同上，`--preview 0` 仍应走 preview 分支（输出 0 行 + 字段元信息），
+    # 不应被 `if 0:` 当成 False 跳过而落进 _query_single 写文件。
+    if preview is not None:
         return {"success": True, "preview": preview_data(df, n=preview)}
 
     if interactive:
@@ -795,9 +918,11 @@ def _query_single(df, input_path, sheet_name,
         'offset': offset,
         'limit': limit,
     }
-    df, error = _apply_pipeline(df, params)
-    if error:
-        raise RuntimeError(error)
+    # A-2 P0-2: _apply_pipeline 现在直接 raise 原始异常，不再返回 (df, error) 元组。
+    # 错误分类（用户错误 vs 内部错误 + traceback）由外层 query_excel 的
+    # except (ValueError, KeyError, FileNotFoundError) / except Exception 双分支
+    # 负责。_query_single 不再重抛 RuntimeError，避免双层包装。
+    result = _apply_pipeline(df, params)
 
     # 确定输出路径
     safe_sheet = _sanitize_sheet_name(sheet_name) if sheet_name else None
@@ -825,7 +950,7 @@ def _query_single(df, input_path, sheet_name,
         out_path = _ensure_unique(out_path)
 
     # 写入输出文件
-    _write_output(df, out_path, fmt)
+    _write_output(result, out_path, fmt)
     return str(out_path)
 
 

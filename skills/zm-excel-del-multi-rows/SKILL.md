@@ -12,6 +12,9 @@ compatibility:
   runtime:
     - name: agent-skills
       call_command: "conda run -n agent-skills python \"$SKILL_DIR/scripts/del_multi_rows.py\" [args]"
+      requires:
+        - pandas
+        - openpyxl
 ---
 
 # zm-excel-del-multi-rows
@@ -87,21 +90,22 @@ result.to_excel('data_删除多行.xlsx', index=False)
 |------|------|------|
 | `--file` | `-f` | 输入文件路径（必填） |
 | `--keyword` | `-k` | 搜索关键词，可多次指定（必填） |
-| `--sheet` | | 指定处理的 sheet 名称或 0-based 整数索引（仅 Excel），不指定则处理所有 sheet |
+| `--sheet` | | 指定处理的 sheet 名称或 0-based 整数索引（仅 Excel），不指定则处理所有 sheet；**纯数字字符串**（如 `'0'` / `'01'`）优先按精确 sheet 名匹配，未命中且为正整数时回退为索引解析（A1-P0-1） |
 | `--match-mode` | | `contains`（子串匹配，默认）或 `exact`（精确匹配） |
 | `--case-sensitive` | | 区分大小写 |
-| `--output` | `-o` | 自定义输出文件路径 |
-| `--format` | | 输出格式：`xlsx` 或 `csv`（默认与输入格式相同） |
+| `--output` | `-o` | 自定义输出文件路径；扩展名需与 `--format` 一致，否则报错退出（A1-P0-2） |
+| `--format` | | 输出格式：`xlsx` 或 `csv`（默认与输入格式相同）；`--format xlsx` 时输出 sheet 固定名为 `Sheet1`，与源 csv 无名称继承关系（A1-P1-4） |
 | `--dry-run` | | 预览模式，只打印将删除的行数，不生成文件 |
-| `--header-row` | | 表头所在行（0-based，默认 0）；xlsx 前几行是注释/合并标题时使用 |
+| `--header-row` | | 表头所在行（0-based，默认 0）；**仅对 xlsx/.xlsm 生效**，CSV 忽略并打 stderr 警告（A1-P1-2） |
 
 ## 输出规范
 
 - 默认输出到源文件同目录，文件名附加 `_删除多行` 后缀
-- **CSV**：输出 `<原文件名>_删除多行.csv`，无 sheet 名后缀
+- **CSV**：输出 `<原文件名>_删除多行.csv`，无 sheet 名后缀；输出编码统一 `utf-8-sig`（含 BOM），确保 Excel 打开中文不乱码（A1-P1-3）
 - **单 sheet Excel（不指定 `--sheet`）**：输出 `<原文件名>_删除多行.xlsx`，**不追加** sheet 名后缀
 - **多 sheet Excel（不指定 `--sheet`）** 或 **显式指定 `--sheet`**：每个 sheet 输出独立文件，文件名追加 `_删除多行_<sheet名>`，如 `data_删除多行_Sheet1.xlsx`；含特殊字符的 sheet 名会被替换为下划线
-- **`--output` 显式路径防护**：单 sheet 时若 `-o` 与 `-f` 指向同一文件，脚本立即报错退出（不进入任何行处理、不打印任何删除统计），避免覆盖源文件；多 sheet + `--output` 同样报错退出，提示省略 `-o` 让脚本按 sheet 自动命名
+- **`--format xlsx` 输出 sheet 固定名为 `Sheet1`**：与源 csv 无任何名称继承关系；`--format csv` 不存在 sheet 概念（A1-P1-4）
+- **`--output` 显式路径防护**：单 sheet 时若 `-o` 与 `-f` 指向同一文件，脚本立即报错退出（不进入任何行处理、不打印任何删除统计），避免覆盖源文件；`-o` 扩展名与 `--format` 不一致时同样立即报错退出，提示调整 `-o` 路径或省略 `-o`（A1-P0-2）；多 sheet + `--output` 也报错退出，提示省略 `-o` 让脚本按 sheet 自动命名
 - 目标文件已存在时自动追加序号（`_1`、`_2`...）
 
 ## 匹配行为
@@ -116,7 +120,7 @@ result.to_excel('data_删除多行.xlsx', index=False)
 - 多关键词用 `-k` 多次指定，不用逗号分隔
 - `--dry-run` 适合先确认范围再执行
 - 大文件一次加载到内存，极端场景需分段处理
-- 代码实现细节（pandas + openpyxl 读写、`utf-8-sig` 输出 CSV、`reset_index(drop=True)`、显式错误处理）见 [README.md](README.md)「设计理念」段
+- 代码实现细节（pandas + openpyxl 读写、`utf-8-sig` 输出 CSV、`reset_index(drop=True)`、显式错误处理）见 [README.md](README.md)「实现要点」段
 
 ## 评测
 

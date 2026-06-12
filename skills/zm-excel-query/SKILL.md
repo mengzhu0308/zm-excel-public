@@ -28,6 +28,7 @@ compatibility:
 
 - 筛选/过滤满足条件的数据
 - 选择特定列、排序、去重
+- 按 XX 分组（仅排序，未要求聚合）→ 使用 `--sort`，不擅自添加 `--groupby`
 - 聚合统计（分组求和、计数、平均值等）
 - 将 Excel 查询结果导出为 CSV
 - 提取数据子集用于后续分析
@@ -38,12 +39,10 @@ compatibility:
 ## 核心原则
 
 - **先预览后查询**：不熟悉的数据先预览结构（列名、类型、示例值），确认字段后再查询
-- **查询即转换**：以 pandas DataFrame 为中间载体，最终输出 CSV
+- **查询只读，输出可推断**：源 Excel 只通过 pandas 只读接口加载，入口 / 出口 `os.stat` 快照对比保证源文件不被改；输出与源 Excel 同目录、同名（扩展名由 `--format` 决定），未指定 `-o` 时若目标已存在则自动追加序号避免覆盖；可通过 `--tag` 附加标识（**仅允许字母数字下划线连字符**）
 - **多操作组合，一步完成**：`--where`、`--select`、`--exclude`、`--sort`、`--distinct`、`--groupby`、`--agg`、`--limit`、`--offset` 可在单次查询中任意组合，AI 推理执行时应优先单条命令完成
 - **"分组"不等于"聚合"**：用户提到"按XX分组"但未要求聚合统计时，理解为**按该列排序**，使用 `--sort`；`--groupby` 仅用于真正聚合，必须与 `--agg` 配合。不要擅自添加 `--select`
 - **零公式依赖**：不涉及 Excel 公式写入或单元格格式化
-- **运行时只读保护**：脚本仅调用 pandas 只读接口（`read_excel` / `read_csv`），并对 `input_path` 做 `os.stat` 快照对比（mtime / size），若查询过程中源文件被改则返回 `{"_read_only_violation": True}` 强制 exit 2；源 Excel 始终保持原始状态
-- **输出即输入的映射**：输出与源 Excel 同目录、同名（仅扩展名不同）；可通过 `--tag` 附加标识（**仅允许字母数字下划线连字符**，`../` 等路径字符会被拒绝）；默认命名时若目标文件已存在则自动追加序号避免覆盖
 
 ## 与 /goal 配合使用
 
@@ -101,6 +100,8 @@ conda run -n agent-skills python "$SKILL_DIR/scripts/query_excel.py" \
 ```
 
 多表输出（如按 sheet 分片）时，在原文件名后追加 sheet 名：`data_Sheet1.csv`、`data_Sheet2.csv`。
+
+**`--tag` + 多 sheet 拼接顺序**：当未传 `--sheet` 且文件含多个工作表，同时使用 `--tag EastHigh` 时，tag 插在 sheet 名与扩展名之间，例如 `data_Sheet1_EastHigh.csv`、`data_Sheet2_EastHigh.csv`；这样不同 sheet 不会共享同一输出文件名。
 
 **未指定 `--sheet` 时的多 sheet 行为**：当 `--sheet` 缺省且文件含多个工作表时，`pd.read_excel` 返回 dict，脚本会对每个 sheet 各跑一次查询并按 sheet 名分片输出；与显式传 `--sheet` 时只跑单 sheet 的行为不同。
 
@@ -185,25 +186,15 @@ result.to_csv('data.csv', index=False, encoding='utf-8-sig')
 | `contains` | 字符串包含 | `name contains '张'` |
 | `startswith` `endswith` | 字符串前缀/后缀 | `email startswith 'admin'` |
 
+> 暂不支持显式 `not` / `~` 取反（用括号 + 反向比较替代，如 `not (age > 30)` 改写为 `age <= 30`）；更多边界详见 [where 表达式语法](references/where-expression.md)。
+
 > 日期列筛选：用 ISO 字符串与 pandas datetime 列比较会自动转换。例如 `date == '2024-01-01'` 会匹配 datetime 值等于 `2024-01-01` 的行。
 >
 > 更细的运算符优先级、边界陷阱（`in` 列表引号、字符串内含 `>=`、3+ 条件 `and`/`or` 链路）与 `pandas.DataFrame.query()` 的差异，参见 [where 表达式语法](references/where-expression.md)。
 
-## 代码规范
+## 实现说明
 
-- 使用 `pandas` 读取 Excel，`openpyxl` 为默认引擎
-- 输出 CSV 使用 `utf-8-sig` 编码
-- 日期列保持 ISO 格式字符串（`YYYY-MM-DD`）
-- 不输出 DataFrame 索引（`index=False`）
-- 一次性查询和交互模式共用同一查询管线 `_apply_pipeline(df, params)`，保证两边行为一致
-- 统一管线返回 `(df, error)` 元组；外层 `main()` 与交互模式据此决定是否 `sys.exit(1)` 或打印错误
-- 解析器（`parse_where`）不向入参 `df` 写入临时列；占位符走 `masks` 字典，杜绝副作用
-- `_parse_where` 切 `and` / `or` 改为 `re.IGNORECASE`，与 pandas.query 习惯一致
-- `_PRECEDENCE` 显式优先级表决定 `and` 绑定比 `or` 紧；改顺序前请同步 `references/where-expression.md`
-- `_validate_tag` 与 `_sanitize_sheet_name` 把 `tag` / `sheet_name` 中的路径危险字符拦截或替换
-- 错误处理分两类：用户错误（`ValueError` / `KeyError` / `FileNotFoundError` / `LookupError`）返回 `"参数或输入错误: ..."`；其他 `Exception` 返回 `"内部错误: ..."` 并附 traceback 供调试
-- `--json` 与 `--interactive` 互斥：互斥时由 `main()` 入口 `parser.error()` 拦截
-- 预览和交互模式输出应适合终端展示
+脚本内部约束（输入读取、输出编码、错误处理、运行时只读保护、占位符无副作用等）见 [references/implementation-notes.md](references/implementation-notes.md)。
 
 ## 注意事项
 

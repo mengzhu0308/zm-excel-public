@@ -1,5 +1,5 @@
 skill_info:
   name: zm-excel-dedup-merge
-  version: 0.3.1
+  version: 0.4.0
   description: "将两个 CSV/XLSX 表格按关键列去重合并，保留两表全部列"
   category: 工作流

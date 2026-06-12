@@ -17,7 +17,7 @@
 `extract_template.py` 和 `write_back.py` 都需要：
 
 - `detect_header_row(ws)`：在前 3 行中挑非空单元格最多的那一行
-- `find_sample_row(ws, header_row_idx)`：从后往前找“≥ 一半表头列有值”的最后一行
+- `find_sample_row(ws, header_cols)`：从后往前找"≥ 一半表头列有值"的最后一行；`header_cols` 由调用方先从 `read_headers` 计算并传入，避免在 `find_sample_row` 内部重复 IO + `normalize_header`
 - `select_worksheet(wb, sheet_name)`：按名字或回退到 active sheet
 - `copy_styles(src, dst)`：复制单元格样式
 - `read_headers(ws, header_row_idx)` / `normalize_header(value)`：把表头规范成字符串
@@ -88,3 +88,17 @@
 ### 扩展名校验
 
 `_common.validate_excel_extension()` 集中处理"非 `.xlsx` / `.xlsm` 一律拒绝"的护栏；`extract_template.py` 与 `write_back.py` 都在 `main()` 入口调用，遇到 `.xls` 等不支持的扩展名会抛 `ValueError` 并被 `main()` 的通用 `except` 兜住（退出码 1），不让 openpyxl 抛非友好的 `zipfile.BadZipFile` 错误。`SUPPORTED_EXCEL_EXTENSIONS` 元组是唯一真相来源，新增支持扩展名时改这里即可。
+
+### 模板两级标题的语义分工
+
+`extract_template.py` 输出的 Markdown 模板同时使用 `##` 与 `#` 两级标题，两者职责不同：
+
+- `## Excel 数据录入模板`：模板级标题，只在文件首部写一次，作为"这是回填模板"的视觉锚点。`write_back.parse_markdown` 的 `_HEADING_RE` 只匹配一级标题，不会把它当成字段名去匹配。
+- `# 字段名`：每个 Excel 表头对应一个一级标题，是回填脚本字段解析的**唯一**依据；写错成 `##` 会被脚本忽略，导致整列无法匹配。
+
+两级分工的好处：
+
+- 模板首部可以加元信息块（`> 来源文件` / `> 工作表`）、占位符说明、视觉锚点，但不会污染字段解析
+- 用户手动写模板时，知道"改 `#` 影响字段，改 `##` 不影响字段"
+
+新增字段或修改元信息时，`extract_template.py` 的 `lines.append(...)` 系列调用是单一真相来源（见 `extract_template.py:101-121`），不要绕过它直接拼字符串。
